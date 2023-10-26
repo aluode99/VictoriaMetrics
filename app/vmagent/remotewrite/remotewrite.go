@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
+	"github.com/cespare/xxhash/v2"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bloomfilter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
@@ -25,8 +28,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/streamaggr"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
-	"github.com/VictoriaMetrics/metrics"
-	"github.com/cespare/xxhash/v2"
 )
 
 var (
@@ -758,17 +759,29 @@ func (rwctx *remoteWriteCtx) reinitStreamAggr() {
 		logger.Errorf("cannot reload stream aggregation config from -remoteWrite.streamAggr.config=%q; continue using the previously loaded config; error: %s", sasFile, err)
 		return
 	}
+
+	defer func() {
+		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_successful{path=%q}`, sasFile)).Set(1)
+		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_success_timestamp_seconds{path=%q}`, sasFile)).Set(fasttime.UnixTimestamp())
+	}()
 	sas := rwctx.sas.Load()
-	if !sasNew.Equal(sas) {
-		sasOld := rwctx.sas.Swap(sasNew)
-		sasOld.MustStop()
-		logger.Infof("successfully reloaded stream aggregation configs at -remoteWrite.streamAggr.config=%q", sasFile)
-	} else {
+	if sasNew.Equal(sas) {
 		sasNew.MustStop()
 		logger.Infof("the config at -remoteWrite.streamAggr.config=%q wasn't changed", sasFile)
+		return
 	}
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_successful{path=%q}`, sasFile)).Set(1)
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_success_timestamp_seconds{path=%q}`, sasFile)).Set(fasttime.UnixTimestamp())
+
+	if sas == nil {
+		sas = &streamaggr.Aggregators{}
+	}
+	sasOldLen := sas.Len()
+	updated := sas.UpdateWith(sasNew)
+	rwctx.sas.Store(sas)
+
+	// no need to stop sas or sasNew as their *aggregator should have been
+	// stopped in UpdateWith method.
+	logger.Infof("successfully reloaded stream aggregation configs at -remoteWrite.streamAggr.config=%q. "+
+		"Total aggregation configs %d (was %d); updated %d.", sasFile, sas.Len(), sasOldLen, updated)
 }
 
 var tssPool = &sync.Pool{
